@@ -233,17 +233,30 @@ fn is_html_response(response: &Response<Body>) -> bool {
 fn append_vary(mut response: Response<Body>) -> Response<Body> {
     let headers = response.headers_mut();
 
-    if let Some(existing) = headers.get(VARY).cloned() {
-        if let Ok(s) = existing.to_str() {
-            if !s.split(',').any(|p| p.trim().eq_ignore_ascii_case("accept")) {
-                let new_val = format!("{s}, Accept");
-                if let Ok(hv) = HeaderValue::from_str(&new_val) {
-                    headers.insert(VARY, hv);
-                }
-            }
-        }
-    } else {
+    let existing_values: Vec<String> = headers
+        .get_all(VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(String::from))
+        .collect();
+
+    if existing_values.is_empty() {
         headers.insert(VARY, HeaderValue::from_static("Accept"));
+    } else {
+        let already_has_accept = existing_values
+            .iter()
+            .any(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case("accept")));
+
+        let combined = existing_values.join(", ");
+        let new_val = if already_has_accept {
+            combined
+        } else {
+            format!("{combined}, Accept")
+        };
+
+        if let Ok(hv) = HeaderValue::from_str(&new_val) {
+            // insert replaces all existing Vary headers with the consolidated one
+            headers.insert(VARY, hv);
+        }
     }
 
     response
@@ -505,5 +518,47 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().get("content-signal").is_none());
+    }
+
+    #[test]
+    fn test_append_vary_preserves_multiple_vary_headers() {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap();
+        response.headers_mut().append(VARY, HeaderValue::from_static("Cookie"));
+        response.headers_mut().append(VARY, HeaderValue::from_static("Accept-Encoding"));
+
+        let response = append_vary(response);
+
+        let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
+        assert!(vary.contains("Cookie"), "Vary should contain Cookie, got: {vary}");
+        assert!(
+            vary.contains("Accept-Encoding"),
+            "Vary should contain Accept-Encoding, got: {vary}"
+        );
+        assert!(vary.contains("Accept"), "Vary should contain Accept, got: {vary}");
+    }
+
+    #[test]
+    fn test_append_vary_multiple_headers_already_has_accept() {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap();
+        response.headers_mut().append(VARY, HeaderValue::from_static("Cookie"));
+        response.headers_mut().append(VARY, HeaderValue::from_static("Accept"));
+
+        let response = append_vary(response);
+
+        let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
+        assert!(vary.contains("Cookie"), "Vary should contain Cookie, got: {vary}");
+        // Should not duplicate Accept — check that the consolidated value
+        // has exactly one "Accept" token (not inside another word)
+        let accept_count = vary
+            .split(',')
+            .filter(|p| p.trim().eq_ignore_ascii_case("accept"))
+            .count();
+        assert_eq!(accept_count, 1, "Accept should appear exactly once, got: {vary}");
     }
 }
