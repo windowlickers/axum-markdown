@@ -1,6 +1,7 @@
 use axum::{Router, response::Html, routing::get};
 use axum_markdown::MarkdownLayer;
 
+#[allow(clippy::unwrap_used)]
 #[tokio::main]
 async fn main() {
     let app = Router::new()
@@ -43,7 +44,7 @@ async fn index() -> Html<&'static str> {
 
 async fn about() -> Html<&'static str> {
     Html(
-        r#"<!DOCTYPE html>
+        r"<!DOCTYPE html>
 <html>
 <head><title>About</title></head>
 <body>
@@ -52,6 +53,6 @@ async fn about() -> Html<&'static str> {
   <p>When a client sends <code>Accept: text/markdown</code>, HTML responses are
   automatically converted to markdown with token count headers.</p>
 </body>
-</html>"#,
+</html>",
     )
 }

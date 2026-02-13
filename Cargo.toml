@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Axum middleware for Cloudflare-style Markdown for Agents content negotiation"
 license = "MIT"
+repository = "https://github.com/windowlickers/axum-markdown"
+keywords = ["axum", "markdown", "middleware", "content-negotiation"]
+categories = ["web-programming::http-server"]
 
 [dependencies]
 axum = "0.8"
@@ -22,3 +25,26 @@ serde_json = "1"
 [[example]]
 name = "basic"
 path = "examples/basic.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+multiple_crate_versions = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true

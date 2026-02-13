@@ -12,6 +12,7 @@ use std::{
     task::{Context, Poll},
 };
 
+#[allow(clippy::expect_used)] // Critical to middleware — no meaningful recovery if tokenizer fails
 static BPE: LazyLock<tiktoken_rs::CoreBPE> =
     LazyLock::new(|| tiktoken_rs::o200k_base().expect("failed to initialize o200k_base tokenizer"));
 use tower::{Layer, Service};
@@ -36,23 +37,27 @@ impl Default for MarkdownConfig {
 
 impl MarkdownConfig {
     /// Create a new default configuration.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the maximum body size for conversion.
-    pub fn max_body_size(mut self, size: usize) -> Self {
+    #[must_use]
+    pub const fn max_body_size(mut self, size: usize) -> Self {
         self.max_body_size = size;
         self
     }
 
     /// Set the Content-Signal header value.
+    #[must_use]
     pub fn content_signal(mut self, signal: impl Into<String>) -> Self {
         self.content_signal = Some(signal.into());
         self
     }
 
     /// Disable the Content-Signal header.
+    #[must_use]
     pub fn no_content_signal(mut self) -> Self {
         self.content_signal = None;
         self
@@ -67,6 +72,7 @@ pub struct MarkdownLayer {
 
 impl MarkdownLayer {
     /// Create a new `MarkdownLayer` with default configuration.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             config: Arc::new(MarkdownConfig::default()),
@@ -74,6 +80,7 @@ impl MarkdownLayer {
     }
 
     /// Create a new `MarkdownLayer` with the given configuration.
+    #[must_use]
     pub fn with_config(config: MarkdownConfig) -> Self {
         Self {
             config: Arc::new(config),
@@ -229,7 +236,7 @@ fn append_vary(mut response: Response<Body>) -> Response<Body> {
     if let Some(existing) = headers.get(VARY).cloned() {
         if let Ok(s) = existing.to_str() {
             if !s.split(',').any(|p| p.trim().eq_ignore_ascii_case("accept")) {
-                let new_val = format!("{}, Accept", s);
+                let new_val = format!("{s}, Accept");
                 if let Ok(hv) = HeaderValue::from_str(&new_val) {
                     headers.insert(VARY, hv);
                 }
@@ -249,41 +256,35 @@ async fn convert_response<E>(
 ) -> Result<Response<Body>, E> {
     let (mut parts, body) = response.into_parts();
 
-    let body_bytes = match to_bytes(body, config.max_body_size).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            // Body too large or read error — the original body is consumed so we
-            // cannot forward it. Return a 502 to signal the failure rather than
-            // silently sending an empty 200.
-            let mut response = Response::new(Body::from(
-                "Markdown conversion failed: response body too large or unreadable",
-            ));
-            *response.status_mut() = http::StatusCode::BAD_GATEWAY;
-            response.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            return Ok(append_vary(response));
-        }
+    let Ok(body_bytes) = to_bytes(body, config.max_body_size).await else {
+        // Body too large or read error — the original body is consumed so we
+        // cannot forward it. Return a 502 to signal the failure rather than
+        // silently sending an empty 200.
+        let mut response = Response::new(Body::from(
+            "Markdown conversion failed: response body too large or unreadable",
+        ));
+        *response.status_mut() = http::StatusCode::BAD_GATEWAY;
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        return Ok(append_vary(response));
     };
 
     let html = String::from_utf8_lossy(&body_bytes);
-    let markdown = match htmd::convert(&html) {
-        Ok(md) => md,
-        Err(_) => {
-            // Conversion failed — return 502 rather than serving raw HTML
-            // with a text/markdown Content-Type (which would be a lie and
-            // a potential XSS vector in markdown renderers).
-            let mut response = Response::new(Body::from(
-                "Markdown conversion failed: unable to convert HTML to markdown",
-            ));
-            *response.status_mut() = http::StatusCode::BAD_GATEWAY;
-            response.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            return Ok(append_vary(response));
-        }
+    let Ok(markdown) = htmd::convert(&html) else {
+        // Conversion failed — return 502 rather than serving raw HTML
+        // with a text/markdown Content-Type (which would be a lie and
+        // a potential XSS vector in markdown renderers).
+        let mut response = Response::new(Body::from(
+            "Markdown conversion failed: unable to convert HTML to markdown",
+        ));
+        *response.status_mut() = http::StatusCode::BAD_GATEWAY;
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        return Ok(append_vary(response));
     };
 
     // Count tokens
@@ -313,6 +314,7 @@ async fn convert_response<E>(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use axum::{Router, routing::get};
