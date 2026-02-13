@@ -8,6 +8,7 @@ readme = "README.md"
 repository = "https://github.com/windowlickers/axum-markdown"
 keywords = ["axum", "markdown", "middleware", "content-negotiation"]
 categories = ["web-programming::http-server"]
+exclude = ["flake.nix", "flake.lock", ".envrc", "CLAUDE.md", "rust-toolchain.toml"]
 
 [dependencies]
 axum = "0.8"
