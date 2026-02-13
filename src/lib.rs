@@ -249,8 +249,17 @@ async fn convert_response<E>(
     let body_bytes = match to_bytes(body, config.max_body_size).await {
         Ok(bytes) => bytes,
         Err(_) => {
-            // Body too large or read error — return original-ish response
-            let response = Response::from_parts(parts, Body::empty());
+            // Body too large or read error — the original body is consumed so we
+            // cannot forward it. Return a 502 to signal the failure rather than
+            // silently sending an empty 200.
+            let mut response = Response::new(Body::from(
+                "Markdown conversion failed: response body too large or unreadable",
+            ));
+            *response.status_mut() = http::StatusCode::BAD_GATEWAY;
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
             return Ok(append_vary(response));
         }
     };
@@ -430,6 +439,34 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let ct = response.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap();
         assert!(ct.contains("application/json"));
+    }
+
+    #[tokio::test]
+    async fn test_body_too_large_returns_502() {
+        let config = MarkdownConfig::new().max_body_size(10); // 10 bytes max
+        let app = Router::new()
+            .route("/", get(|| async {
+                axum::response::Html("<html><body><h1>This body is definitely larger than 10 bytes</h1></body></html>")
+            }))
+            .layer(MarkdownLayer::with_config(config));
+
+        let req = Request::builder()
+            .uri("/")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let ct = response.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert!(ct.contains("text/plain"));
+        let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
+        assert!(vary.contains("Accept"));
+
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("too large"));
     }
 
     #[tokio::test]
