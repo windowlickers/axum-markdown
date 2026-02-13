@@ -8,9 +8,12 @@ use pin_project_lite::pin_project;
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
 };
+
+static BPE: LazyLock<tiktoken_rs::CoreBPE> =
+    LazyLock::new(|| tiktoken_rs::o200k_base().expect("failed to initialize o200k_base tokenizer"));
 use tower::{Layer, Service};
 
 /// Configuration for the markdown conversion middleware.
@@ -203,7 +206,7 @@ where
 /// Check if the Accept header explicitly contains `text/markdown`.
 fn wants_markdown(headers: &HeaderMap) -> bool {
     headers.get_all(ACCEPT).iter().any(|val| {
-        val.to_str().ok().map_or(false, |s| {
+        val.to_str().ok().is_some_and(|s| {
             s.split(',')
                 .any(|part| part.split(';').next().unwrap_or("").trim() == "text/markdown")
         })
@@ -216,7 +219,7 @@ fn is_html_response(response: &Response<Body>) -> bool {
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |ct| ct.contains("text/html"))
+        .is_some_and(|ct| ct.contains("text/html"))
 }
 
 /// Append `Accept` to the `Vary` header of a response.
@@ -284,9 +287,7 @@ async fn convert_response<E>(
     };
 
     // Count tokens
-    let token_count = tiktoken_rs::o200k_base()
-        .map(|bpe| bpe.encode_with_special_tokens(&markdown).len())
-        .unwrap_or(0);
+    let token_count = BPE.encode_with_special_tokens(&markdown).len();
 
     // Update headers
     parts
