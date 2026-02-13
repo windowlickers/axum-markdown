@@ -9,9 +9,13 @@
     };
     crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
+    advisory-db = {
+      url = "github:rustsec/advisory-db";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, crane, flake-utils }:
+  outputs = { self, nixpkgs, rust-overlay, crane, flake-utils, advisory-db }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -64,6 +68,10 @@
           tests = craneLib.cargoTest (commonArgs // {
             inherit cargoArtifacts;
           });
+
+          audit = craneLib.cargoAudit {
+            inherit src advisory-db;
+          };
         };
 
         packages = {
@@ -76,6 +84,7 @@
           packages = with pkgs; [
             cargo-watch
             cargo-edit
+            cargo-audit
           ];
 
           RUST_BACKTRACE = "1";

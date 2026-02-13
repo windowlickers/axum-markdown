@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Axum middleware for Cloudflare-style Markdown for Agents content negotiation"
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/windowlickers/axum-markdown"
 keywords = ["axum", "markdown", "middleware", "content-negotiation"]
 categories = ["web-programming::http-server"]

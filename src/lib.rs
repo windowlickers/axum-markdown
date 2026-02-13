@@ -1,8 +1,8 @@
-use axum::body::{Body, to_bytes};
+use axum::body::{to_bytes, Body};
 use bytes::Bytes;
 use http::{
-    HeaderMap, HeaderValue, Request, Response,
     header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, VARY},
+    HeaderMap, HeaderValue, Request, Response,
 };
 use pin_project_lite::pin_project;
 use std::{
@@ -194,13 +194,13 @@ where
                     }
 
                     let config = Arc::clone(config);
-                    let converting = Box::pin(async move {
-                        convert_response(response, &config).await
-                    });
+                    let converting =
+                        Box::pin(async move { convert_response(response, &config).await });
 
-                    self.as_mut().project().state.set(FutureState::Converting {
-                        future: converting,
-                    });
+                    self.as_mut()
+                        .project()
+                        .state
+                        .set(FutureState::Converting { future: converting });
                 }
                 FutureStateProj::Converting { future } => {
                     return future.poll(cx);
@@ -242,9 +242,10 @@ fn append_vary(mut response: Response<Body>) -> Response<Body> {
     if existing_values.is_empty() {
         headers.insert(VARY, HeaderValue::from_static("Accept"));
     } else {
-        let already_has_accept = existing_values
-            .iter()
-            .any(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case("accept")));
+        let already_has_accept = existing_values.iter().any(|s| {
+            s.split(',')
+                .any(|p| p.trim().eq_ignore_ascii_case("accept"))
+        });
 
         let combined = existing_values.join(", ");
         let new_val = if already_has_accept {
@@ -304,9 +305,10 @@ async fn convert_response<E>(
     let token_count = BPE.encode_with_special_tokens(&markdown).len();
 
     // Update headers
-    parts
-        .headers
-        .insert(CONTENT_TYPE, HeaderValue::from_static("text/markdown; charset=utf-8"));
+    parts.headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/markdown; charset=utf-8"),
+    );
     parts.headers.remove(CONTENT_LENGTH);
 
     if let Ok(hv) = HeaderValue::from_str(&token_count.to_string()) {
@@ -330,7 +332,7 @@ async fn convert_response<E>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use axum::{Router, routing::get};
+    use axum::{routing::get, Router};
     use http::StatusCode;
     use tower::ServiceExt;
 
@@ -341,9 +343,10 @@ mod tests {
     fn app() -> Router {
         Router::new()
             .route("/", get(|| async { axum::response::Html(html_response()) }))
-            .route("/json", get(|| async {
-                axum::Json(serde_json::json!({"key": "value"}))
-            }))
+            .route(
+                "/json",
+                get(|| async { axum::Json(serde_json::json!({"key": "value"})) }),
+            )
             .layer(MarkdownLayer::new())
     }
 
@@ -357,7 +360,10 @@ mod tests {
     #[test]
     fn test_wants_markdown_with_params() {
         let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("text/markdown; charset=utf-8"));
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("text/markdown; charset=utf-8"),
+        );
         assert!(wants_markdown(&headers));
     }
 
@@ -396,15 +402,17 @@ mod tests {
     async fn test_html_passthrough_without_accept() {
         let app = app();
 
-        let req = Request::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
 
         let response = app.oneshot(req).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let ct = response.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap();
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/html"));
 
         // Should still have Vary: Accept
@@ -426,7 +434,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let ct = response.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap();
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(ct, "text/markdown; charset=utf-8");
 
         // Should have token count header
@@ -442,7 +455,12 @@ mod tests {
         assert!(tokens > 0);
 
         // Should have Content-Signal header
-        let signal = response.headers().get("content-signal").unwrap().to_str().unwrap();
+        let signal = response
+            .headers()
+            .get("content-signal")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(signal, "ai-train=yes, search=yes, ai-input=yes");
 
         // Should have Vary: Accept
@@ -469,7 +487,12 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let ct = response.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap();
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("application/json"));
     }
 
@@ -491,7 +514,12 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let ct = response.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap();
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/plain"));
         let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
         assert!(vary.contains("Accept"));
@@ -526,18 +554,28 @@ mod tests {
             .status(StatusCode::OK)
             .body(Body::empty())
             .unwrap();
-        response.headers_mut().append(VARY, HeaderValue::from_static("Cookie"));
-        response.headers_mut().append(VARY, HeaderValue::from_static("Accept-Encoding"));
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Cookie"));
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Accept-Encoding"));
 
         let response = append_vary(response);
 
         let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
-        assert!(vary.contains("Cookie"), "Vary should contain Cookie, got: {vary}");
+        assert!(
+            vary.contains("Cookie"),
+            "Vary should contain Cookie, got: {vary}"
+        );
         assert!(
             vary.contains("Accept-Encoding"),
             "Vary should contain Accept-Encoding, got: {vary}"
         );
-        assert!(vary.contains("Accept"), "Vary should contain Accept, got: {vary}");
+        assert!(
+            vary.contains("Accept"),
+            "Vary should contain Accept, got: {vary}"
+        );
     }
 
     #[test]
@@ -546,19 +584,29 @@ mod tests {
             .status(StatusCode::OK)
             .body(Body::empty())
             .unwrap();
-        response.headers_mut().append(VARY, HeaderValue::from_static("Cookie"));
-        response.headers_mut().append(VARY, HeaderValue::from_static("Accept"));
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Cookie"));
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Accept"));
 
         let response = append_vary(response);
 
         let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
-        assert!(vary.contains("Cookie"), "Vary should contain Cookie, got: {vary}");
+        assert!(
+            vary.contains("Cookie"),
+            "Vary should contain Cookie, got: {vary}"
+        );
         // Should not duplicate Accept — check that the consolidated value
         // has exactly one "Accept" token (not inside another word)
         let accept_count = vary
             .split(',')
             .filter(|p| p.trim().eq_ignore_ascii_case("accept"))
             .count();
-        assert_eq!(accept_count, 1, "Accept should appear exactly once, got: {vary}");
+        assert_eq!(
+            accept_count, 1,
+            "Accept should appear exactly once, got: {vary}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-use axum::{Router, response::Html, routing::get};
+use axum::{response::Html, routing::get, Router};
 use axum_markdown::MarkdownLayer;
 
 #[allow(clippy::unwrap_used)]
