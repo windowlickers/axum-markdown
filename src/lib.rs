@@ -265,7 +265,23 @@ async fn convert_response<E>(
     };
 
     let html = String::from_utf8_lossy(&body_bytes);
-    let markdown = htmd::convert(&html).unwrap_or_else(|_| html.into_owned());
+    let markdown = match htmd::convert(&html) {
+        Ok(md) => md,
+        Err(_) => {
+            // Conversion failed — return 502 rather than serving raw HTML
+            // with a text/markdown Content-Type (which would be a lie and
+            // a potential XSS vector in markdown renderers).
+            let mut response = Response::new(Body::from(
+                "Markdown conversion failed: unable to convert HTML to markdown",
+            ));
+            *response.status_mut() = http::StatusCode::BAD_GATEWAY;
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            return Ok(append_vary(response));
+        }
+    };
 
     // Count tokens
     let token_count = tiktoken_rs::o200k_base()
