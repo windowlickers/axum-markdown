@@ -30,7 +30,7 @@ Add the layer to your router:
 use axum::{Router, response::Html, routing::get};
 use axum_markdown::MarkdownLayer;
 
-let app = Router::new()
+let app: Router = Router::new()
     .route("/", get(|| async { Html("<h1>Hello</h1><p>World</p>") }))
     .layer(MarkdownLayer::new());
 ```
@@ -50,6 +50,7 @@ let layer = MarkdownLayer::with_config(config);
 To disable the `content-signal` header entirely:
 
 ```rust
+# use axum_markdown::MarkdownConfig;
 let config = MarkdownConfig::new().no_content_signal();
 ```
 
@@ -74,9 +75,12 @@ Each in-flight conversion buffers the full response body, the converted markdown
 For production deployments, consider placing a concurrency limit in front of this middleware to bound total memory usage:
 
 ```rust
+# use axum::{Router, routing::get};
+# use axum_markdown::MarkdownLayer;
 use tower::limit::ConcurrencyLimitLayer;
+# async fn handler() -> &'static str { "" }
 
-let app = Router::new()
+let app: Router = Router::new()
     .route("/", get(handler))
     .layer(MarkdownLayer::new())
     .layer(ConcurrencyLimitLayer::new(64));  // at most 64 concurrent conversions

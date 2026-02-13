@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use axum::body::{to_bytes, Body};
 use bytes::Bytes;
 use http::{
