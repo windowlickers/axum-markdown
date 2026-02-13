@@ -41,7 +41,7 @@ let app = Router::new()
 use axum_markdown::{MarkdownConfig, MarkdownLayer};
 
 let config = MarkdownConfig::new()
-    .max_body_size(5 * 1024 * 1024)       // 5MB limit (default: 10MB)
+    .max_body_size(5 * 1024 * 1024)       // 5MB limit (default: 1MB)
     .content_signal("ai-train=no");        // custom Content-Signal value
 
 let layer = MarkdownLayer::with_config(config);
@@ -65,6 +65,21 @@ curl http://localhost:3000/
 
 # Markdown response
 curl -H 'Accept: text/markdown' http://localhost:3000/
+```
+
+## Memory Usage
+
+Each in-flight conversion buffers the full response body, the converted markdown string, and a token encoding vector in memory simultaneously. With the default 1MB `max_body_size`, worst-case memory per concurrent conversion request is roughly 4MB.
+
+For production deployments, consider placing a concurrency limit in front of this middleware to bound total memory usage:
+
+```rust
+use tower::limit::ConcurrencyLimitLayer;
+
+let app = Router::new()
+    .route("/", get(handler))
+    .layer(MarkdownLayer::new())
+    .layer(ConcurrencyLimitLayer::new(64));  // at most 64 concurrent conversions
 ```
 
 ## License

@@ -16,7 +16,7 @@ use tower::{Layer, Service};
 /// Configuration for the markdown conversion middleware.
 #[derive(Debug, Clone)]
 pub struct MarkdownConfig {
-    /// Maximum HTML body size (in bytes) to attempt conversion on. Default: 10MB.
+    /// Maximum HTML body size (in bytes) to attempt conversion on. Default: 1MB.
     pub max_body_size: usize,
     /// Optional value for the `Content-Signal` response header.
     pub content_signal: Option<String>,
@@ -25,7 +25,7 @@ pub struct MarkdownConfig {
 impl Default for MarkdownConfig {
     fn default() -> Self {
         Self {
-            max_body_size: 10 * 1024 * 1024,
+            max_body_size: 1024 * 1024,
             content_signal: Some("ai-train=yes, search=yes, ai-input=yes".to_string()),
         }
     }
