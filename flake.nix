@@ -29,7 +29,12 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        src = craneLib.cleanCargoSource ./.;
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            (builtins.match ".*README\\.md$" path != null)
+            || (craneLib.filterCargoSources path type);
+        };
 
         commonBuildInputs = with pkgs; [ openssl ]
           ++ lib.optionals stdenv.isDarwin [
@@ -65,8 +70,19 @@
             cargoClippyExtraArgs = "--all-targets -- -D warnings";
           });
 
+          clippy-no-default = craneLib.cargoClippy (commonArgs // {
+            inherit cargoArtifacts;
+            cargoExtraArgs = "--no-default-features";
+            cargoClippyExtraArgs = "--all-targets -- -D warnings";
+          });
+
           tests = craneLib.cargoTest (commonArgs // {
             inherit cargoArtifacts;
+          });
+
+          tests-no-default = craneLib.cargoTest (commonArgs // {
+            inherit cargoArtifacts;
+            cargoExtraArgs = "--no-default-features";
           });
 
           audit = craneLib.cargoAudit {

@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![doc = include_str!("../README.md")]
 
 use axum::body::{to_bytes, Body};
@@ -8,24 +9,146 @@ use http::{
 };
 use pin_project_lite::pin_project;
 use std::{
+    fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, LazyLock},
+    sync::Arc,
     task::{Context, Poll},
 };
-
-#[allow(clippy::expect_used)] // Critical to middleware — no meaningful recovery if tokenizer fails
-static BPE: LazyLock<tiktoken_rs::CoreBPE> =
-    LazyLock::new(|| tiktoken_rs::o200k_base().expect("failed to initialize o200k_base tokenizer"));
 use tower::{Layer, Service};
 
+// ── Traits ──────────────────────────────────────────────────────
+
+/// Error type returned by [`HtmlConverter::convert`].
+pub type ConvertError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Converts an HTML string to markdown.
+///
+/// The default implementation ([`HtmdConverter`]) delegates to
+/// [`htmd::convert`].
+pub trait HtmlConverter: Send + Sync {
+    /// Convert `html` to a markdown string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTML cannot be converted.
+    fn convert(&self, html: &str) -> Result<String, ConvertError>;
+}
+
+/// Counts tokens in a text string.
+///
+/// When the `tokens` feature is enabled (default), the built-in
+/// [`TiktokenCounter`] uses the `o200k_base` tokenizer.
+pub trait TokenCounter: Send + Sync {
+    /// Return the token count for `text`.
+    fn count_tokens(&self, text: &str) -> usize;
+}
+
+// ── Default implementations ─────────────────────────────────────
+
+/// HTML-to-markdown converter backed by [`htmd`].
+#[derive(Debug, Clone, Copy)]
+pub struct HtmdConverter;
+
+impl HtmlConverter for HtmdConverter {
+    fn convert(&self, html: &str) -> Result<String, ConvertError> {
+        htmd::convert(html).map_err(Into::into)
+    }
+}
+
+/// Token counter using [`tiktoken_rs`] with the `o200k_base`
+/// tokenizer.
+///
+/// Only available when the `tokens` feature is enabled (default).
+#[cfg(feature = "tokens")]
+#[derive(Debug, Clone, Copy)]
+pub struct TiktokenCounter;
+
+#[cfg(feature = "tokens")]
+#[allow(clippy::expect_used)] // No meaningful recovery if tokenizer fails
+static BPE: std::sync::LazyLock<tiktoken_rs::CoreBPE> = std::sync::LazyLock::new(|| {
+    tiktoken_rs::o200k_base().expect("failed to initialize o200k_base tokenizer")
+});
+
+#[cfg(feature = "tokens")]
+impl TokenCounter for TiktokenCounter {
+    fn count_tokens(&self, text: &str) -> usize {
+        BPE.encode_with_special_tokens(text).len()
+    }
+}
+
+// ── WantsMarkdown extractor ─────────────────────────────────────
+
+/// Infallible axum extractor indicating whether the client sent
+/// `Accept: text/markdown`.
+///
+/// ```rust
+/// # use axum_markdown::WantsMarkdown;
+/// # use axum::response::IntoResponse;
+/// async fn handler(
+///     WantsMarkdown(wants_md): WantsMarkdown,
+/// ) -> impl IntoResponse {
+///     if wants_md { "markdown" } else { "html" }
+/// }
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct WantsMarkdown(pub bool);
+
+impl<S> axum::extract::FromRequestParts<S> for WantsMarkdown
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(wants_markdown(&parts.headers)))
+    }
+}
+
+// ── Configuration ───────────────────────────────────────────────
+
+type SkipPredicate = Arc<dyn Fn(&Request<Body>) -> bool + Send + Sync>;
+
 /// Configuration for the markdown conversion middleware.
-#[derive(Debug, Clone)]
+///
+/// Use the builder methods to customise behaviour:
+///
+/// ```rust
+/// use axum_markdown::MarkdownConfig;
+///
+/// let config = MarkdownConfig::new()
+///     .max_body_size(2 * 1024 * 1024)
+///     .content_signal("ai-train=no");
+/// ```
+#[derive(Clone)]
+#[non_exhaustive]
 pub struct MarkdownConfig {
-    /// Maximum HTML body size (in bytes) to attempt conversion on. Default: 1MB.
-    pub max_body_size: usize,
-    /// Optional value for the `Content-Signal` response header.
-    pub content_signal: Option<String>,
+    max_body_size: usize,
+    content_signal: Option<String>,
+    converter: Arc<dyn HtmlConverter>,
+    token_counter: Option<Arc<dyn TokenCounter>>,
+    skip_predicate: Option<SkipPredicate>,
+}
+
+impl fmt::Debug for MarkdownConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MarkdownConfig")
+            .field("max_body_size", &self.max_body_size)
+            .field("content_signal", &self.content_signal)
+            .field("converter", &"<dyn HtmlConverter>")
+            .field(
+                "token_counter",
+                &self.token_counter.as_ref().map(|_| "<dyn TokenCounter>"),
+            )
+            .field(
+                "skip_predicate",
+                &self.skip_predicate.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for MarkdownConfig {
@@ -33,6 +156,12 @@ impl Default for MarkdownConfig {
         Self {
             max_body_size: 1024 * 1024,
             content_signal: Some("ai-train=yes, search=yes, ai-input=yes".to_string()),
+            converter: Arc::new(HtmdConverter),
+            #[cfg(feature = "tokens")]
+            token_counter: Some(Arc::new(TiktokenCounter)),
+            #[cfg(not(feature = "tokens"))]
+            token_counter: None,
+            skip_predicate: None,
         }
     }
 }
@@ -44,29 +173,81 @@ impl MarkdownConfig {
         Self::default()
     }
 
-    /// Set the maximum body size for conversion.
+    /// Set the maximum body size (in bytes) for conversion.
+    /// Default: 1 MB.
     #[must_use]
     pub const fn max_body_size(mut self, size: usize) -> Self {
         self.max_body_size = size;
         self
     }
 
-    /// Set the Content-Signal header value.
+    /// Set the `Content-Signal` response header value.
     #[must_use]
     pub fn content_signal(mut self, signal: impl Into<String>) -> Self {
         self.content_signal = Some(signal.into());
         self
     }
 
-    /// Disable the Content-Signal header.
+    /// Disable the `Content-Signal` header.
     #[must_use]
     pub fn no_content_signal(mut self) -> Self {
         self.content_signal = None;
         self
     }
+
+    /// Use a custom HTML-to-markdown converter.
+    #[must_use]
+    pub fn converter(mut self, converter: impl HtmlConverter + 'static) -> Self {
+        self.converter = Arc::new(converter);
+        self
+    }
+
+    /// Use a custom token counter.
+    #[must_use]
+    pub fn token_counter(mut self, counter: impl TokenCounter + 'static) -> Self {
+        self.token_counter = Some(Arc::new(counter));
+        self
+    }
+
+    /// Disable token counting (omits `x-markdown-tokens` header).
+    #[must_use]
+    pub fn no_token_counter(mut self) -> Self {
+        self.token_counter = None;
+        self
+    }
+
+    /// Skip markdown conversion for requests matching `predicate`.
+    ///
+    /// The predicate receives the incoming request and returns
+    /// `true` to skip conversion. The response still gets
+    /// `Vary: Accept`.
+    ///
+    /// ```rust
+    /// use axum_markdown::MarkdownConfig;
+    ///
+    /// let config = MarkdownConfig::new()
+    ///     .skip_when(|req| req.uri().path().starts_with("/api"));
+    /// ```
+    #[must_use]
+    pub fn skip_when(
+        mut self,
+        predicate: impl Fn(&Request<Body>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.skip_predicate = Some(Arc::new(predicate));
+        self
+    }
 }
 
-/// Tower layer that wraps services with markdown content negotiation.
+impl From<MarkdownConfig> for MarkdownLayer {
+    fn from(config: MarkdownConfig) -> Self {
+        Self::with_config(config)
+    }
+}
+
+// ── Layer ───────────────────────────────────────────────────────
+
+/// Tower layer that wraps services with markdown content
+/// negotiation.
 #[derive(Debug, Clone)]
 pub struct MarkdownLayer {
     config: Arc<MarkdownConfig>,
@@ -107,6 +288,8 @@ impl<S> Layer<S> for MarkdownLayer {
     }
 }
 
+// ── Service ─────────────────────────────────────────────────────
+
 /// Tower service that performs markdown content negotiation.
 #[derive(Debug, Clone)]
 pub struct MarkdownService<S> {
@@ -129,7 +312,8 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let convert = wants_markdown(req.headers());
+        let skipped = self.config.skip_predicate.as_ref().is_some_and(|p| p(&req));
+        let convert = !skipped && wants_markdown(req.headers());
         let config = Arc::clone(&self.config);
         let future = self.inner.call(req);
 
@@ -143,8 +327,10 @@ where
     }
 }
 
+// ── Future ──────────────────────────────────────────────────────
+
 pin_project! {
-    /// Future returned by `MarkdownService`.
+    /// Future returned by [`MarkdownService`].
     pub struct MarkdownFuture<F, E> {
         #[pin]
         state: FutureState<F, E>,
@@ -190,14 +376,19 @@ where
                     };
 
                     if !*convert || !is_html_response(&response) {
-                        // Pass through, but still add Vary: Accept
-                        let response = append_vary(response);
-                        return Poll::Ready(Ok(response));
+                        #[cfg(feature = "tracing")]
+                        tracing::trace!("passthrough (no conversion)");
+                        return Poll::Ready(Ok(append_vary(response)));
                     }
 
                     let config = Arc::clone(config);
-                    let converting =
-                        Box::pin(async move { convert_response(response, &config).await });
+                    let fut = async move { convert_response(response, &config).await };
+                    #[cfg(feature = "tracing")]
+                    let fut = tracing::Instrument::instrument(
+                        fut,
+                        tracing::debug_span!("markdown_conversion"),
+                    );
+                    let converting = Box::pin(fut);
 
                     self.as_mut()
                         .project()
@@ -211,6 +402,8 @@ where
         }
     }
 }
+
+// ── Helpers ─────────────────────────────────────────────────────
 
 /// Check if the Accept header explicitly contains `text/markdown`.
 fn wants_markdown(headers: &HeaderMap) -> bool {
@@ -257,7 +450,6 @@ fn append_vary(mut response: Response<Body>) -> Response<Body> {
         };
 
         if let Ok(hv) = HeaderValue::from_str(&new_val) {
-            // insert replaces all existing Vary headers with the consolidated one
             headers.insert(VARY, hv);
         }
     }
@@ -270,14 +462,18 @@ async fn convert_response<E>(
     response: Response<Body>,
     config: &MarkdownConfig,
 ) -> Result<Response<Body>, E> {
+    #[cfg(feature = "tracing")]
+    let start = std::time::Instant::now();
+
     let (mut parts, body) = response.into_parts();
 
+    // Original body is consumed; cannot forward
     let Ok(body_bytes) = to_bytes(body, config.max_body_size).await else {
-        // Body too large or read error — the original body is consumed so we
-        // cannot forward it. Return a 502 to signal the failure rather than
-        // silently sending an empty 200.
+        #[cfg(feature = "tracing")]
+        tracing::warn!("markdown conversion failed: body too large or unreadable");
         let mut response = Response::new(Body::from(
-            "Markdown conversion failed: response body too large or unreadable",
+            "Markdown conversion failed: \
+             response body too large or unreadable",
         ));
         *response.status_mut() = http::StatusCode::BAD_GATEWAY;
         response.headers_mut().insert(
@@ -288,12 +484,13 @@ async fn convert_response<E>(
     };
 
     let html = String::from_utf8_lossy(&body_bytes);
-    let Ok(markdown) = htmd::convert(&html) else {
-        // Conversion failed — return 502 rather than serving raw HTML
-        // with a text/markdown Content-Type (which would be a lie and
-        // a potential XSS vector in markdown renderers).
+    // 502 rather than serving raw HTML as text/markdown
+    let Ok(markdown) = config.converter.convert(&html) else {
+        #[cfg(feature = "tracing")]
+        tracing::warn!("markdown conversion failed: converter error");
         let mut response = Response::new(Body::from(
-            "Markdown conversion failed: unable to convert HTML to markdown",
+            "Markdown conversion failed: \
+             unable to convert HTML to markdown",
         ));
         *response.status_mut() = http::StatusCode::BAD_GATEWAY;
         response.headers_mut().insert(
@@ -303,18 +500,26 @@ async fn convert_response<E>(
         return Ok(append_vary(response));
     };
 
-    // Count tokens
-    let token_count = BPE.encode_with_special_tokens(&markdown).len();
+    let token_count = config
+        .token_counter
+        .as_ref()
+        .map(|c| c.count_tokens(&markdown));
 
-    // Update headers
     parts.headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/markdown; charset=utf-8"),
     );
-    parts.headers.remove(CONTENT_LENGTH);
 
-    if let Ok(hv) = HeaderValue::from_str(&token_count.to_string()) {
-        parts.headers.insert("x-markdown-tokens", hv);
+    let markdown_bytes = Bytes::from(markdown);
+
+    if let Ok(hv) = HeaderValue::from_str(&markdown_bytes.len().to_string()) {
+        parts.headers.insert(CONTENT_LENGTH, hv);
+    }
+
+    if let Some(count) = token_count {
+        if let Ok(hv) = HeaderValue::from_str(&count.to_string()) {
+            parts.headers.insert("x-markdown-tokens", hv);
+        }
     }
 
     if let Some(ref signal) = config.content_signal {
@@ -323,7 +528,21 @@ async fn convert_response<E>(
         }
     }
 
-    let markdown_bytes = Bytes::from(markdown);
+    #[cfg(feature = "tracing")]
+    {
+        let body_size = body_bytes.len();
+        let md_size = markdown_bytes.len();
+        let tokens = token_count.unwrap_or(0);
+        let duration_ms = start.elapsed().as_millis();
+        tracing::debug!(
+            body_size,
+            markdown_size = md_size,
+            token_count = tokens,
+            duration_ms,
+            "markdown conversion complete"
+        );
+    }
+
     let mut response = Response::from_parts(parts, Body::from(markdown_bytes));
     response = append_vary(response);
 
@@ -417,7 +636,6 @@ mod tests {
             .unwrap();
         assert!(ct.contains("text/html"));
 
-        // Should still have Vary: Accept
         let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
         assert!(vary.contains("Accept"));
     }
@@ -444,19 +662,22 @@ mod tests {
             .unwrap();
         assert_eq!(ct, "text/markdown; charset=utf-8");
 
-        // Should have token count header
-        assert!(response.headers().get("x-markdown-tokens").is_some());
-        let tokens: usize = response
-            .headers()
-            .get("x-markdown-tokens")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(tokens > 0);
+        #[cfg(feature = "tokens")]
+        {
+            assert!(response.headers().get("x-markdown-tokens").is_some());
+            let tokens: usize = response
+                .headers()
+                .get("x-markdown-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(tokens > 0);
+        }
+        #[cfg(not(feature = "tokens"))]
+        assert!(response.headers().get("x-markdown-tokens").is_none());
 
-        // Should have Content-Signal header
         let signal = response
             .headers()
             .get("content-signal")
@@ -465,11 +686,9 @@ mod tests {
             .unwrap();
         assert_eq!(signal, "ai-train=yes, search=yes, ai-input=yes");
 
-        // Should have Vary: Accept
         let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
         assert!(vary.contains("Accept"));
 
-        // Body should be markdown
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let md = String::from_utf8(body.to_vec()).unwrap();
         assert!(md.contains("# Hello"));
@@ -500,11 +719,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_body_too_large_returns_502() {
-        let config = MarkdownConfig::new().max_body_size(10); // 10 bytes max
+        let config = MarkdownConfig::new().max_body_size(10);
         let app = Router::new()
-            .route("/", get(|| async {
-                axum::response::Html("<html><body><h1>This body is definitely larger than 10 bytes</h1></body></html>")
-            }))
+            .route(
+                "/",
+                get(|| async {
+                    axum::response::Html(
+                        "<html><body><h1>This body is \
+                         definitely larger than 10 bytes\
+                         </h1></body></html>",
+                    )
+                }),
+            )
             .layer(MarkdownLayer::with_config(config));
 
         let req = Request::builder()
@@ -600,8 +826,6 @@ mod tests {
             vary.contains("Cookie"),
             "Vary should contain Cookie, got: {vary}"
         );
-        // Should not duplicate Accept — check that the consolidated value
-        // has exactly one "Accept" token (not inside another word)
         let accept_count = vary
             .split(',')
             .filter(|p| p.trim().eq_ignore_ascii_case("accept"))
@@ -610,5 +834,234 @@ mod tests {
             accept_count, 1,
             "Accept should appear exactly once, got: {vary}"
         );
+    }
+
+    // ── New tests ───────────────────────────────────────────────
+
+    struct UppercaseConverter;
+
+    impl HtmlConverter for UppercaseConverter {
+        fn convert(&self, html: &str) -> Result<String, ConvertError> {
+            Ok(html.to_uppercase())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_converter() {
+        let config = MarkdownConfig::new()
+            .converter(UppercaseConverter)
+            .no_token_counter();
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async { axum::response::Html("<h1>hello</h1>") }),
+            )
+            .layer(MarkdownLayer::with_config(config));
+
+        let req = Request::builder()
+            .uri("/")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/markdown; charset=utf-8");
+
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(text, "<H1>HELLO</H1>");
+    }
+
+    struct ConstantCounter(usize);
+
+    impl TokenCounter for ConstantCounter {
+        fn count_tokens(&self, _text: &str) -> usize {
+            self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_token_counter() {
+        let config = MarkdownConfig::new().token_counter(ConstantCounter(42));
+        let app = Router::new()
+            .route("/", get(|| async { axum::response::Html(html_response()) }))
+            .layer(MarkdownLayer::with_config(config));
+
+        let req = Request::builder()
+            .uri("/")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+
+        let tokens: usize = response
+            .headers()
+            .get("x-markdown-tokens")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(tokens, 42);
+    }
+
+    #[tokio::test]
+    async fn test_no_token_counter_omits_header() {
+        let config = MarkdownConfig::new().no_token_counter();
+        let app = Router::new()
+            .route("/", get(|| async { axum::response::Html(html_response()) }))
+            .layer(MarkdownLayer::with_config(config));
+
+        let req = Request::builder()
+            .uri("/")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-markdown-tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_skip_when_skips_matching_paths() {
+        let config = MarkdownConfig::new().skip_when(|req| req.uri().path().starts_with("/api"));
+        let app = Router::new()
+            .route(
+                "/api/data",
+                get(|| async { axum::response::Html(html_response()) }),
+            )
+            .route(
+                "/page",
+                get(|| async { axum::response::Html(html_response()) }),
+            )
+            .layer(MarkdownLayer::with_config(config));
+
+        // /api/data should be skipped
+        let req = Request::builder()
+            .uri("/api/data")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.clone().oneshot(req).await.unwrap();
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.contains("text/html"), "skipped path should remain HTML");
+        let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
+        assert!(vary.contains("Accept"), "Vary should still be set");
+
+        // /page should be converted
+        let req = Request::builder()
+            .uri("/page")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/markdown; charset=utf-8");
+    }
+
+    #[tokio::test]
+    async fn test_wants_markdown_extractor() {
+        let app = Router::new().route(
+            "/",
+            get(|WantsMarkdown(wants_md): WantsMarkdown| async move {
+                if wants_md {
+                    "yes"
+                } else {
+                    "no"
+                }
+            }),
+        );
+
+        // Without Accept: text/markdown
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"no");
+
+        // With Accept: text/markdown
+        let req = Request::builder()
+            .uri("/")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"yes");
+    }
+
+    #[tokio::test]
+    async fn test_content_length_set_on_conversion() {
+        let app = Router::new()
+            .route("/", get(|| async { axum::response::Html(html_response()) }))
+            .layer(MarkdownLayer::new());
+
+        let req = Request::builder()
+            .uri("/")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+
+        let content_length: usize = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(content_length, body.len());
+    }
+
+    #[tokio::test]
+    async fn test_from_config_for_layer() {
+        let config = MarkdownConfig::new().no_content_signal();
+        let layer: MarkdownLayer = config.into();
+        let app = Router::new()
+            .route("/", get(|| async { axum::response::Html(html_response()) }))
+            .layer(layer);
+
+        let req = Request::builder()
+            .uri("/")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/markdown; charset=utf-8");
+        assert!(response.headers().get("content-signal").is_none());
     }
 }
